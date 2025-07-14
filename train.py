@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
-from torchvision import transforms
+from torchvision import transforms, models
+from torch.optim.lr_scheduler import StepLR
 from PIL import Image
 import pandas as pd
 import os
@@ -65,6 +66,22 @@ class FourCornerCNN(nn.Module):
         x = x.view(-1, 5, 10)  #  reshape为(批次, 5位, 10个类别)
         return x
 
+# ResNet模型定义
+class FourCornerResNet(nn.Module):
+    def __init__(self, pretrained=True):
+        super(FourCornerResNet, self).__init__()
+        self.resnet = models.resnet18(pretrained=pretrained)
+        # 修改第一个卷积层以接受灰度图像
+        self.resnet.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        # 修改全连接层
+        num_ftrs = self.resnet.fc.in_features
+        self.resnet.fc = nn.Linear(num_ftrs, 5 * 10)
+
+    def forward(self, x):
+        x = self.resnet(x)
+        x = x.view(-1, 5, 10) # reshape为(批次, 5位, 10个类别)
+        return x
+
 # 数据增强和预处理
 transform = transforms.Compose([
     transforms.Resize((64, 64)),
@@ -75,7 +92,7 @@ transform = transforms.Compose([
 ])
 
 # 训练函数
-def train_model(model, train_loader, criterion, optimizer, num_epochs, device):
+def train_model(model, train_loader, criterion, optimizer, scheduler, num_epochs, device):
     model.train()
     for epoch in range(num_epochs):
         running_loss = 0.0
@@ -89,9 +106,12 @@ def train_model(model, train_loader, criterion, optimizer, num_epochs, device):
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
+        
+        scheduler.step()
+
         epoch_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}")
-        wandb.log({"epoch": epoch + 1, "train_loss": epoch_loss})
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+        wandb.log({"epoch": epoch + 1, "train_loss": epoch_loss, "learning_rate": scheduler.get_last_lr()[0]})
 
 # 预测函数
 def predict_four_corner(model, char, csv_file, img_dir, device, transform):
@@ -161,7 +181,23 @@ def test_model(model, test_loader, criterion, device):
 # 主程序
 def main():
     # 初始化wandb
-    wandb.init(project="four-corner-cnn", config=config.__dict__)
+    # wandb.init(project="four-corner-cnn", config=config.__dict__)
+    wandb.init(
+        project="four-corner-cnn",
+        config={
+            "CSV_FILE": str(config.CSV_FILE),
+            "IMAGE_DIR": str(config.IMAGE_DIR),
+            "FONT_PATH": str(config.FONT_PATH),
+            "IMAGE_SIZE": config.IMAGE_SIZE,
+            "FONT_SIZE": config.FONT_SIZE,
+            "DEVICE": str(config.DEVICE),  # torch.device 需要转换为字符串
+            "BATCH_SIZE": config.BATCH_SIZE,
+            "NUM_EPOCHS": config.NUM_EPOCHS,
+            "LEARNING_RATE": config.LEARNING_RATE,
+            "MODEL_SAVE_PATH": str(config.MODEL_SAVE_PATH),
+            "TEST_CHARACTER": config.TEST_CHARACTER
+        }
+    )
 
     # 从config模块加载配置
     device = config.DEVICE
@@ -187,15 +223,17 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     # 初始化模型、损失函数和优化器
-    model = FourCornerCNN().to(device)
+    # model = FourCornerCNN().to(device)
+    model = FourCornerResNet(pretrained=True).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = StepLR(optimizer, step_size=10, gamma=0.1) # 每10个epoch学习率乘以0.1
 
     # 监视模型
     wandb.watch(model, log='all')
 
     # 训练模型
-    train_model(model, train_loader, criterion, optimizer, num_epochs, device)
+    train_model(model, train_loader, criterion, optimizer, scheduler, num_epochs, device)
 
     # 测试模型
     test_model(model, test_loader, criterion, device)
