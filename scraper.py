@@ -77,7 +77,7 @@ def main():
     Main function to read characters from a CSV, scrape their four-corner codes,
     and write the results back to the CSV.
     """
-    csv_file = 'four_corner_data.csv'
+    csv_file = 'four_corner_data_more.csv'
 
     # Try to read the CSV file
     try:
@@ -117,7 +117,7 @@ def main():
     print(f"Found {len(chars_to_query)} characters to query.")
 
     # Process characters in batches of 50
-    batch_size = 50
+    batch_size = 90
     updated_count = 0
     for i in range(0, len(chars_to_query), batch_size):
         batch_chars = chars_to_query[i:i+batch_size]

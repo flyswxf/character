@@ -1,8 +1,8 @@
 import pandas as pd
 
 def process_characters():
-    txt_file_path = 'chinese/3500常用字.txt'
-    csv_file_path = 'four_corner_data.csv'
+    txt_file_path = 'chinese/Chinese16159.txt'
+    csv_file_path = 'four_corner_data_more.csv'
 
     # Read characters from the text file
     with open(txt_file_path, 'r', encoding='utf-8') as f:
