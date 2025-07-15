@@ -12,28 +12,38 @@ import config
 
 # 自定义数据集类
 class FourCornerDataset(Dataset):
-    def __init__(self, csv_file, img_dir, transform=None):
+    def __init__(self, csv_file, img_dir, transform=None, corner_transform=None):
         self.data = pd.read_csv(csv_file)
         self.img_dir = img_dir
         self.transform = transform
+        self.corner_transform = corner_transform
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        four_corner = str(self.data.iloc[idx]['four_corner']).zfill(5)  # 确保5位
+        four_corner = str(self.data.iloc[idx]['four_corner']).zfill(5)
         img_path = os.path.join(self.img_dir, f"{idx}.png")
+        image = Image.open(img_path).convert('L')
 
-        # 加载图像
-        image = Image.open(img_path).convert('L')  # 转换为灰度图
-        if self.transform:
-            image = self.transform(image)
+        # 提取四个角
+        w, h = image.size
+        corner_size = int(w / 2)
+        # Top-left, Top-right, Bottom-left, Bottom-right
+        corners = [
+            image.crop((0, 0, corner_size, corner_size)),
+            image.crop((w - corner_size, 0, w, corner_size)),
+            image.crop((0, h - corner_size, corner_size, h)),
+            image.crop((w - corner_size, h - corner_size, w, h))
+        ]
 
-        # 将四角号码转换为标签（每位数字为0-9）
-        labels = [int(d) for d in four_corner]
-        labels = torch.tensor(labels, dtype=torch.long)
+        # 应用变换
+        x_full = self.transform(image) if self.transform else image
+        corner_images = [self.corner_transform(c) if self.corner_transform else c for c in corners]
 
-        return image, labels
+        labels = torch.tensor([int(d) for d in four_corner], dtype=torch.long)
+
+        return (*corner_images, x_full), labels
 
 
 
@@ -82,24 +92,105 @@ class FourCornerResNet(nn.Module):
         x = x.view(-1, 5, 10) # reshape为(批次, 5位, 10个类别)
         return x
 
+# 多分支模型定义
+class CornerBranch(nn.Module):
+    def __init__(self):
+        super(CornerBranch, self).__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+        )
+        self.fc_layers = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(32 * 8 * 8, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5), # 添加Dropout
+            nn.Linear(128, 10)
+        )
+
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = self.fc_layers(x)
+        return x
+
+class FullImageBranch(nn.Module):
+    def __init__(self):
+        super(FullImageBranch, self).__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+        self.fc_layers = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 8 * 8, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5), # 添加Dropout
+            nn.Linear(256, 10)
+        )
+
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = self.fc_layers(x)
+        return x
+
+class FourCornerHybridNN(nn.Module):
+    def __init__(self):
+        super(FourCornerHybridNN, self).__init__()
+        self.branch_tl = CornerBranch() # Top-left
+        self.branch_tr = CornerBranch() # Top-right
+        self.branch_bl = CornerBranch() # Bottom-left
+        self.branch_br = CornerBranch() # Bottom-right
+        self.branch_full = FullImageBranch() # Full image for 5th digit
+
+    def forward(self, x_tl, x_tr, x_bl, x_br, x_full):
+        out_tl = self.branch_tl(x_tl)
+        out_tr = self.branch_tr(x_tr)
+        out_bl = self.branch_bl(x_bl)
+        out_br = self.branch_br(x_br)
+        out_full = self.branch_full(x_full)
+        return torch.stack([out_tl, out_tr, out_bl, out_br, out_full], dim=1)
+
 # 数据增强和预处理
 transform = transforms.Compose([
     transforms.Resize((64, 64)),
     transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,)),
-    transforms.RandomRotation(10),
-    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1))
+    transforms.Normalize((0.5,), (0.5,))
+])
+
+corner_transform = transforms.Compose([
+    transforms.Resize((32, 32)),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
 ])
 
 # 训练函数
-def train_model(model, train_loader, criterion, optimizer, scheduler, num_epochs, device):
-    model.train()
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device):
+    # 早停法相关变量
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    patience = 5 # 如果验证损失连续5个epoch没有改善，则停止训练
+
     for epoch in range(num_epochs):
+        # 训练阶段
+        model.train()
         running_loss = 0.0
-        for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
+        for (x_tl, x_tr, x_bl, x_br, x_full), labels in train_loader:
+            x_tl, x_tr, x_bl, x_br, x_full, labels = \
+                x_tl.to(device), x_tr.to(device), x_bl.to(device), x_br.to(device), x_full.to(device), labels.to(device)
+
             optimizer.zero_grad()
-            outputs = model(images)  # (batch_size, 5, 10)
+            outputs = model(x_tl, x_tr, x_bl, x_br, x_full)  # (batch_size, 5, 10)
             loss = 0
             for i in range(5):  # 对每位数字计算损失
                 loss += criterion(outputs[:, i, :], labels[:, i])
@@ -108,13 +199,43 @@ def train_model(model, train_loader, criterion, optimizer, scheduler, num_epochs
             running_loss += loss.item()
         
         scheduler.step()
-
         epoch_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
-        wandb.log({"epoch": epoch + 1, "train_loss": epoch_loss, "learning_rate": scheduler.get_last_lr()[0]})
+
+        # 验证阶段
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for (x_tl, x_tr, x_bl, x_br, x_full), labels in val_loader:
+                x_tl, x_tr, x_bl, x_br, x_full, labels = \
+                    x_tl.to(device), x_tr.to(device), x_bl.to(device), x_br.to(device), x_full.to(device), labels.to(device)
+                outputs = model(x_tl, x_tr, x_bl, x_br, x_full)
+                loss = 0
+                for i in range(5):
+                    loss += criterion(outputs[:, i, :], labels[:, i])
+                val_loss += loss.item()
+        
+        epoch_val_loss = val_loss / len(val_loader)
+
+        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {epoch_loss:.4f}, Val Loss: {epoch_val_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+        wandb.log({"epoch": epoch + 1, "train_loss": epoch_loss, "val_loss": epoch_val_loss, "learning_rate": scheduler.get_last_lr()[0]})
+
+        # 早停法逻辑
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            epochs_no_improve = 0
+            # 保存最佳模型
+            torch.save(model.state_dict(), 'best_model.pth')
+        else:
+            epochs_no_improve += 1
+        
+        if epochs_no_improve >= patience:
+            print(f'Early stopping triggered after {epoch + 1} epochs.')
+            break
+    # 加载最佳模型
+    model.load_state_dict(torch.load('best_model.pth'))
 
 # 预测函数
-def predict_four_corner(model, char, csv_file, img_dir, device, transform):
+def predict_four_corner(model, char, csv_file, img_dir, device, transform, corner_transform):
     model.eval()
     
     # 从CSV中找到汉字对应的索引
@@ -130,13 +251,24 @@ def predict_four_corner(model, char, csv_file, img_dir, device, transform):
         return f"图像文件 '{img_path}' 不存在。"
 
     image = Image.open(img_path).convert('L')
-    
-    # 预处理图像
-    image = transform(image).unsqueeze(0).to(device)
+
+    # 提取四个角
+    w, h = image.size
+    corner_size = int(w / 2)
+    corners = [
+        image.crop((0, 0, corner_size, corner_size)),
+        image.crop((w - corner_size, 0, w, corner_size)),
+        image.crop((0, h - corner_size, corner_size, h)),
+        image.crop((w - corner_size, h - corner_size, w, h))
+    ]
+
+    # 应用变换
+    x_full = transform(image).unsqueeze(0).to(device)
+    corner_images = [corner_transform(c).unsqueeze(0).to(device) for c in corners]
     
     # 预测
     with torch.no_grad():
-        output = model(image)  # (1, 5, 10)
+        output = model(*corner_images, x_full)  # (1, 5, 10)
         _, predicted = torch.max(output, dim=2)  # 每位取最大概率
         four_corner = ''.join([str(p.item()) for p in predicted[0]])
     return four_corner
@@ -148,9 +280,11 @@ def test_model(model, test_loader, criterion, device):
     correct = [0] * 5
     total = 0
     with torch.no_grad():
-        for images, labels in test_loader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
+        for (x_tl, x_tr, x_bl, x_br, x_full), labels in test_loader:
+            x_tl, x_tr, x_bl, x_br, x_full, labels = \
+                x_tl.to(device), x_tr.to(device), x_bl.to(device), x_br.to(device), x_full.to(device), labels.to(device)
+            
+            outputs = model(x_tl, x_tr, x_bl, x_br, x_full)
             loss = 0
             for i in range(5):
                 loss += criterion(outputs[:, i, :], labels[:, i])
@@ -210,30 +344,36 @@ def main():
     test_char = config.TEST_CHARACTER
 
     # 创建数据集
-    dataset = FourCornerDataset(csv_file, img_dir, transform=transform)
+    dataset = FourCornerDataset(csv_file, img_dir, transform=transform, corner_transform=corner_transform)
 
-    # 划分训练集和测试集
+    # 划分训练集、验证集和测试集
     test_split = 0.2
+    val_split = 0.1
     dataset_size = len(dataset)
     test_size = int(test_split * dataset_size)
-    train_size = dataset_size - test_size
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+    val_size = int(val_split * (dataset_size - test_size))
+    train_size = dataset_size - test_size - val_size
+    train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     # 初始化模型、损失函数和优化器
     # model = FourCornerCNN().to(device)
-    model = FourCornerResNet(pretrained=True).to(device)
+    # model = FourCornerResNet(pretrained=True).to(device)
+    model = FourCornerHybridNN().to(device)
+
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    # 添加 L2 正则化 (weight_decay)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     scheduler = StepLR(optimizer, step_size=10, gamma=0.1) # 每10个epoch学习率乘以0.1
 
     # 监视模型
     wandb.watch(model, log='all')
 
     # 训练模型
-    train_model(model, train_loader, criterion, optimizer, scheduler, num_epochs, device)
+    train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device)
 
     # 测试模型
     test_model(model, test_loader, criterion, device)
@@ -243,7 +383,7 @@ def main():
     print(f"模型已保存至 {model_save_path}")
 
     # 示例：预测一个字的四角号码
-    predicted_code = predict_four_corner(model, test_char, csv_file, img_dir, device, transform)
+    predicted_code = predict_four_corner(model, test_char, csv_file, img_dir, device, transform, corner_transform)
     print(f"汉字 '{test_char}' 的预测四角号码: {predicted_code}")
 
     wandb.finish()
